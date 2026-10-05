@@ -15,6 +15,7 @@
 | 不可变版本 | 每次发布写入一个新的 revision；历史 revision 永不被覆盖，可通过 `?revision=N` 固定取瓦片 |
 | 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
+| 点选（identify） | `GET /datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=[&revision=]`，在瓦片内点击处（源像素 `0≤px,py<256`、半径 `0–8 px`）按**编译后可见几何**裁决命中：面内距离为 0，线 / 点须落在圆形半径内；逐源要素编译，**保留 0 基源序号**与 4096 网格上的**亚像素点击位置**，无 ID / 字符串 ID / 重复 ID 不合并、量化后消失的几何不命中、缓冲边缘按同半径裁决，结果按距离再按源序号排序（见 [§4.9](#49-点选identify)） |
 | 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围由两份 GeoJSON 的全部要素几何（含无 ID / 重复 ID）外扩 **8 px 缓冲**求并集得到，新增 / 删除 / 移动 / 属性变化及缓冲邻瓦片都不漏报，源文档不同但瓦片编码相同不报，**z=14 局部更新只枚举局部邻瓦片** |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
@@ -24,7 +25,7 @@
 | 稳定排序 | 图层按名称、要素按 ID（数值 → 字符串 → 内容哈希）确定性排序后编码 |
 | 字节一致 / ETag | 同一 revision + 同一瓦片坐标，重复请求**字节完全相同、ETag 相同**；已编译瓦片持久化到 SQLite |
 | 条件请求 | 支持 `If-None-Match`，命中时返回 **304 Not Modified** |
-| 错误处理 | 非法 GeoJSON / 非法几何 / 无效瓦片参数返回 **400**，数据集或版本不存在返回 **404** |
+| 错误处理 | 非法 GeoJSON / 非法几何 / 无效瓦片参数返回 **400**，数据集或版本不存在返回 **404**；点选的非法瓦片号、`px/py/radius_px/revision` 同样返回 **400**（见 [§4.9](#49-点选identify)） |
 | 一键启动 | 提供 `Dockerfile` 与 `docker-compose.yml`，数据持久化在命名卷中；两个 worker 在全新卷上同时建库由**非阻塞**文件锁 + 有界重试串行化，两者都会完整启动（见 [§3.2](#32-全新数据卷初始化竞态复核)）；另有进程持续占锁时启动会**在退避预算内明确失败退出而不是悬挂**，解锁后可正常启动（见 [§3.3](#33-持锁--解锁启动复核docker-compose)） |
 
 ---
@@ -34,8 +35,9 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、瓦片增量清单、错误处理
+│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、点选、瓦片增量清单、错误处理
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
+│   ├── identify.py      # 点选裁决：逐源编译可见几何，按到亚像素点击点的距离判定命中
 │   ├── tilediff.py      # 瓦片增量候选集：几何 mercator 包围盒外扩 8 px 求并集
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
@@ -48,7 +50,7 @@
 │   └── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（91 个用例，含瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（134 个用例，含点选裁决、瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -67,6 +69,9 @@ docker compose up -d --build
 - 服务地址：<http://localhost:8000>
 - 交互文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/healthz>
+- 点选 API（发布数据后即可调用）：
+  `GET http://localhost:8000/datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=`
+  （用法与真实请求 / 响应示例见 [§4.9](#49-点选identify)）
 - SQLite 数据库保存在 Docker 命名卷 `tile-data`（容器内 `/data/tiles.db`），容器重建后数据不丢
 - 默认以 **2 个 uvicorn worker 进程**启动（`VT_WORKERS=2`），两个进程共享同一个
   SQLite 文件；**首次启动建库由跨进程文件锁串行化、并带有界重试**（见
@@ -757,7 +762,8 @@ curl -s -i "http://localhost:8000/datasets/nope/tile-diff?from_revision=1&to_rev
 | GeoJSON 不是 FeatureCollection / 空集合 / JSON 解析失败 / 坐标越界 / 自交多边形 / null 几何 | `400` |
 | 瓦片 `z` 超出 0–14、`x/y` 为负或超出该级别范围、非整数 | `400` |
 | tile-diff 缺少 `from_revision` / `to_revision` / `z`、修订号非整数或 < 1、`z` 超出 0–14 | `400` |
-| 数据集或 `revision` 不存在（含 tile-diff 的任一修订） | `404` |
+| identify 缺少 `px` / `py` / `radius_px`、非数字或非有限数、`px/py` 不满足 `0≤值<256`、`radius_px` 不满足 `0≤值≤8`、`revision` 非正整数、瓦片号非法 | `400` |
+| 数据集或 `revision` 不存在（含 tile-diff 的任一修订、identify 的钉版） | `404` |
 | 发布版本时 `expected_revision` 与 head 不一致 | `409` |
 | 上传体积超过限制（默认 50 MB） | `413` |
 
@@ -977,10 +983,162 @@ curl -s -w "\n%{http_code}\n" -X POST http://localhost:8000/datasets \
 400
 ```
 
+### 4.9 点选（identify）
+
+在已发布的 revision 上对某张瓦片内的一次点击做点选查询，返回点击命中的要素列表。
+端点复用瓦片的**同一条编译链路**（投影 → 8 px 缓冲裁剪 → 0.5 px 简化 → 4096
+量化 → 清洗，见 [§5](#5-瓦片规格编译管线)），但**逐源要素编译**而不是解码合并后的
+MVT，因此天然保留：
+
+- **0 基源序号 `source_index`**：命中要素在发布的 GeoJSON `features` 数组中的下标
+  （从 `0` 开始）；
+- **亚像素点击位置**：`px/py`（源像素，`0 ≤ px,py < 256`）映射到 4096 网格
+  （`× 16`）后**保持浮点、不做量化**，所以点到量化点要素 0.26 px 时会如实报
+  0.26 px，而不是吸附为 0；
+- **要素身份**：无 ID、字符串 ID、重复 ID 的要素各自独立裁决，**绝不合并**；
+- **可见几何**：裁剪掉、维度降级或量化后坍缩消失（如 §4.8 的 0.1 mm 小三角）的
+  几何在该瓦片中不可见，**不可能被点中**。
+
+**裁决规则**（距离均在 4096 网格上量算、再换算回源像素，1 px = 16 单位）：
+
+| 几何 | 命中条件 |
+| --- | --- |
+| 面（Polygon/MultiPolygon） | 点击落在**编译后面内部**（含边界面）→ `distance_px = 0`；点在面外时按到面边界的距离与半径比较 |
+| 线（LineString/MultiLineString） | 点击到线的距离 **≤ `radius_px`** |
+| 点（Point/MultiPoint） | 点击到点的距离 **≤ `radius_px`** |
+
+跨瓦片的几何只在 **8 px 缓冲**内可见，因此**瓦片缓冲边缘处的点击同样按
+`radius_px` 圆形半径裁决**（缓冲外没有编译几何，自然不命中）。命中列表按
+`distance_px` 升序、距离相同再按 `source_index` 升序排列。
+
+**查询参数**：
+
+| 参数 | 必填 | 取值 | 说明 |
+| --- | --- | --- | --- |
+| `px`, `py` | 是 | `0 ≤ 值 < 256`（支持小数） | 点击点在瓦片内的源像素坐标，原点为瓦片左上角、X 向右、Y 向下 |
+| `radius_px` | 是 | `0 ≤ radius_px ≤ 8` | 圆形命中半径（像素）；`0` 表示只接受零距离（面内部、正好压在线 / 点量化位置） |
+| `revision` | 否 | 正整数 | 钉到指定历史 revision；**省略时查当前 head** |
+
+#### 请求
+
+先用 [§4.1](#41-发布图层创建数据集revision-1) 发布 `data/sample.geojson`
+（含北京点、线、矩形），然后点选北京点要素所在的 **z=14** 瓦片。瓦片号
+`13489/6208` 是北京（116.4074, 39.9042）所在瓦片；`px=212.51、py=84.087` 是该
+经纬度在瓦片内的亚像素位置，半径给 4 px：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/14/13489/6208/identify?px=212.51&py=84.087&radius_px=4" \
+  | python3 -m json.tool
+```
+
+#### 响应（200 OK）
+
+```json
+{
+    "dataset_id": "4c35e9016c2944168107b48155e8949c",
+    "revision": 1,
+    "z": 14,
+    "x": 13489,
+    "y": 6208,
+    "px": 212.51,
+    "py": 84.087,
+    "radius_px": 4.0,
+    "hits": [
+        {
+            "source_index": 0,
+            "source_id": 1001,
+            "properties": {
+                "kind": "capital",
+                "name": "Beijing"
+            },
+            "distance_px": 0.0265
+        }
+    ]
+}
+```
+
+- 北京点在源数组下标 `0`（0 基），`source_id` 即 GeoJSON 的 `id=1001`；
+- `distance_px` 为 **0.0265**：点击点（亚像素浮点）与量化后的点格点相差约
+  0.03 px，小于 4 px 半径而命中；
+- `revision` 是实际查询的版本（省略 `revision` 时即当前 head）。
+
+**面内点击 → 距离 0**。对示例矩形（`id=3001`，源下标 `3`）所在的 z=3 瓦片
+`6/3`，用 `radius_px=0` 点在矩形内部：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/3/6/3/identify?px=85.312&py=169.312&radius_px=0"
+```
+
+```json
+{
+    "dataset_id": "4c35e9016c2944168107b48155e8949c",
+    "revision": 1,
+    "z": 3,
+    "x": 6,
+    "y": 3,
+    "px": 85.312,
+    "py": 169.312,
+    "radius_px": 0.0,
+    "hits": [
+        {
+            "source_index": 3,
+            "source_id": 3001,
+            "properties": {"name": "Demo rectangle"},
+            "distance_px": 0.0
+        }
+    ]
+}
+```
+
+点在无几何区域 / 半径不足时返回空 `hits`（仍是 200）；钉历史版本加
+`&revision=N`，省略即 head：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=10&py=10&radius_px=0"
+# {"dataset_id":"...","revision":1,"z":0,"x":0,"y":0,"px":10.0,"py":10.0,"radius_px":0.0,"hits":[]}
+```
+
+#### 错误（400 / 404）
+
+非法瓦片号、坐标或半径返回 **400**，数据集或版本不存在返回 **404**：
+
+```bash
+# px 越界（必须 0 <= px < 256）
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=256&py=10&radius_px=2"
+# HTTP/1.1 400 Bad Request
+# {"error":"'px' must satisfy 0 <= px < 256"}
+
+# 半径越界（必须 0 <= radius_px <= 8）
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=10&py=10&radius_px=9"
+# HTTP/1.1 400 Bad Request
+# {"error":"'radius_px' must satisfy 0 <= radius_px <= 8"}
+
+# 缺少必填参数 / 非数字 / revision 非法
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=10&py=10"
+# HTTP/1.1 400 Bad Request
+# {"error":"missing required query parameter 'radius_px'"}
+
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/15/0/0/identify?px=1&py=1&radius_px=1"
+# HTTP/1.1 400 Bad Request
+# {"error":"zoom z must be between 0 and 14"}
+
+# 数据集 / 版本不存在
+curl -s -i "http://localhost:8000/datasets/nope/tiles/0/0/0/identify?px=1&py=1&radius_px=1"
+# HTTP/1.1 404 Not Found
+# {"error":"dataset not found","dataset_id":"nope"}
+
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=1&py=1&radius_px=1&revision=99"
+# HTTP/1.1 404 Not Found
+# {"error":"revision 99 does not exist","dataset_id":"...","latest_revision":1}
+```
+
+> **不影响瓦片**：点选只读取 revision 的源要素并在请求内重编译几何做距离裁决，
+> **不读取也不写入** SQLite `tile_cache`，因此既有的
+> `GET …/{z}/{x}/{y}.mvt` 瓦片字节与 ETag 完全不变。
+
 ---
 
 ## 5. 瓦片规格（编译管线）
-
 对每个瓦片坐标与每个源要素依次执行：
 
 1. **投影**：经度/纬度（EPSG:4326）→ 球面 Web Mercator 米（EPSG:3857，
@@ -1025,6 +1183,7 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `GET` | `/datasets` | 列出全部数据集 |
 | `GET` | `/datasets/{id}` | 数据集元数据与全部 revision |
 | `GET/HEAD` | `/datasets/{id}/tiles/{z}/{x}/{y}.mvt` | 获取瓦片（支持 `?revision=N` 与 `If-None-Match`） |
+| `GET` | `/datasets/{id}/tiles/{z}/{x}/{y}/identify` | 瓦片内点选（必填 `px`、`py`（0–<256）、`radius_px`（0–8），可选 `revision`；省略查 head） |
 | `GET` | `/datasets/{id}/tile-diff` | 两修订间实际字节变化的瓦片增量清单（`from_revision`、`to_revision`、`z=0–14`） |
 | `GET` | `/healthz` | 健康检查 |
 | `GET` | `/docs` | Swagger UI 交互文档 |

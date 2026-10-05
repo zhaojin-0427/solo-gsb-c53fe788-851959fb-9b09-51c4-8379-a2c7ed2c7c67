@@ -7,6 +7,7 @@ POST /datasets/{dataset_id}/revisions               append revision (409 on conf
 GET  /datasets                                      list datasets
 GET  /datasets/{dataset_id}                         dataset metadata + revisions
 GET  /datasets/{dataset_id}/tiles/{z}/{x}/{y}.mvt   vector tile (ETag / 304)
+GET  /datasets/{dataset_id}/tiles/{z}/{x}/{y}/identify   click identify
 GET  /datasets/{dataset_id}/tile-diff               incremental changed-tile manifest
 GET  /healthz                                       liveness
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import uuid
@@ -29,6 +31,7 @@ from . import db
 from . import tilediff
 from .config import settings
 from .geojson import GeoJSONValidationError, features_to_canonical_json, parse_geojson
+from .identify import identify_features
 from .tiler import compile_tile, tile_etag
 
 
@@ -311,6 +314,37 @@ def _parse_tile_coord(z_raw: str, x_raw: str, y_raw: str):
     return z, x, y
 
 
+def _parse_bounded_float(
+    raw: str | None, name: str, lower: float, upper: float, inclusive_upper: bool
+) -> float:
+    """Parse a click parameter (px / py / radius_px); raise ValueError for 400."""
+    if raw is None:
+        raise ValueError(f"missing required query parameter '{name}'")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be a number")
+    if not math.isfinite(value):
+        raise ValueError(f"'{name}' must be a finite number")
+    if value < lower or (value >= upper if not inclusive_upper else value > upper):
+        bracket = "<=" if inclusive_upper else "<"
+        raise ValueError(f"'{name}' must satisfy {lower:g} <= {name} {bracket} {upper:g}")
+    return value
+
+
+def _parse_optional_revision(raw: str | None) -> int | None:
+    """Parse the optional ``revision`` query parameter (``None`` -> head)."""
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("'revision' must be an integer")
+    if value < 1:
+        raise ValueError("'revision' must reference an existing revision (>=1)")
+    return value
+
+
 def _load_revision_features(conn, dataset_id: str, revision: int):
     """Return parsed features for a revision (LRU cached)."""
     cache_key = (dataset_id, revision)
@@ -455,6 +489,88 @@ async def get_tile(
                 else "public, no-cache"
             ),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Click identify
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/datasets/{dataset_id}/tiles/{z}/{x}/{y}/identify",
+    tags=["tiles"],
+    name="identify",
+)
+def identify(
+    dataset_id: str,
+    z: str,
+    x: str,
+    y: str,
+    request: Request,
+) -> JSONResponse:
+    """Identify the features a click lands on inside one tile.
+
+    Query parameters
+    ----------------
+    px, py      : click position in source pixels, ``0 <= v < 256``
+                  (origin at the tile's upper-left corner)
+    radius_px   : hit radius in pixels, ``0 <= radius_px <= 8``
+    revision    : optional pinned revision; defaults to the current head
+
+    Every source feature of the revision is run individually through the
+    same project / clip / simplify / quantise pipeline that compiles the
+    MVT, so the result matches what is drawn: features without an ID, with
+    string IDs or duplicate IDs are adjudicated separately, and geometry
+    that vanishes under quantisation never hits.  Area interiors hit at
+    distance zero; lines and points must fall inside the ``radius_px``
+    circle.  Buffered tile edges are adjudicated with the same radius.
+    Hits are ordered by ``distance_px`` and then ``source_index`` (0-based).
+    """
+    try:
+        z_i, x_i, y_i = _parse_tile_coord(z, x, y)
+        params = request.query_params
+        px = _parse_bounded_float(params.get("px"), "px", 0.0, 256.0, False)
+        py = _parse_bounded_float(params.get("py"), "py", 0.0, 256.0, False)
+        radius_px = _parse_bounded_float(
+            params.get("radius_px"), "radius_px", 0.0, float(settings.buffer_px), True
+        )
+        revision = _parse_optional_revision(params.get("revision"))
+    except ValueError as exc:
+        return _error(400, str(exc))
+
+    with db.connection() as conn:
+        dataset = db.get_dataset(conn, dataset_id)
+        if dataset is None:
+            return _error(404, "dataset not found", dataset_id=dataset_id)
+        head_revision = dataset["latest_revision"]
+        chosen_revision = revision if revision is not None else head_revision
+        if db.get_revision(conn, dataset_id, chosen_revision) is None:
+            return _error(
+                404,
+                f"revision {chosen_revision} does not exist",
+                dataset_id=dataset_id,
+                latest_revision=head_revision,
+            )
+        features = _load_revision_features(conn, dataset_id, chosen_revision)
+
+    # Identify only reads features and recompiles their geometry; it never
+    # touches tile_cache, so served tile bytes and ETags are unaffected.
+    hits = identify_features(
+        features, z_i, x_i, y_i, px=px, py=py, radius_px=radius_px
+    )
+    return JSONResponse(
+        content={
+            "dataset_id": dataset_id,
+            "revision": chosen_revision,
+            "z": z_i,
+            "x": x_i,
+            "y": y_i,
+            "px": px,
+            "py": py,
+            "radius_px": radius_px,
+            "hits": hits,
+        }
     )
 
 
