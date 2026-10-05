@@ -7,6 +7,7 @@ POST /datasets/{dataset_id}/revisions               append revision (409 on conf
 GET  /datasets                                      list datasets
 GET  /datasets/{dataset_id}                         dataset metadata + revisions
 GET  /datasets/{dataset_id}/tiles/{z}/{x}/{y}.mvt   vector tile (ETag / 304)
+GET  /datasets/{dataset_id}/tiles/{z}/{x}/{y}/identify  point identify (hit-test)
 GET  /datasets/{dataset_id}/tile-diff               incremental changed-tile manifest
 GET  /healthz                                       liveness
 """
@@ -29,6 +30,7 @@ from . import db
 from . import tilediff
 from .config import settings
 from .geojson import GeoJSONValidationError, features_to_canonical_json, parse_geojson
+from .identify import identify_features
 from .tiler import compile_tile, tile_etag
 
 
@@ -455,6 +457,125 @@ async def get_tile(
                 else "public, no-cache"
             ),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Point identify (hit-test)
+# ---------------------------------------------------------------------------
+
+
+def _parse_pixel_param(raw: str | None, name: str) -> float:
+    """Parse ``px`` / ``py``: required click position, 0 <= value < 256 px."""
+    if raw is None:
+        raise ValueError(f"missing required query parameter '{name}'")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be a number")
+    if not (0.0 <= value < settings.tile_size_px):
+        raise ValueError(
+            f"'{name}' must satisfy 0 <= {name} < {settings.tile_size_px}"
+        )
+    return value
+
+
+def _parse_radius_param(raw: str | None) -> float:
+    """Parse ``radius_px``: required hit-test radius, 0-8 pixels."""
+    if raw is None:
+        raise ValueError("missing required query parameter 'radius_px'")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("'radius_px' must be a number")
+    if not (0.0 <= value <= settings.buffer_px):
+        raise ValueError(
+            f"'radius_px' must be between 0 and {settings.buffer_px}"
+        )
+    return value
+
+
+def _parse_optional_revision_param(raw: str | None) -> int | None:
+    """Parse the optional ``revision`` pin (``None`` means head revision)."""
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("'revision' must be an integer")
+    if value < 1:
+        raise ValueError("'revision' must reference an existing revision (>=1)")
+    return value
+
+
+@app.get("/datasets/{dataset_id}/tiles/{z}/{x}/{y}/identify", tags=["identify"])
+def identify_tile(
+    dataset_id: str,
+    z: str,
+    x: str,
+    y: str,
+    request: Request,
+) -> JSONResponse:
+    """Hit-test one tile pixel against the visible geometries of a revision.
+
+    Query parameters
+    ----------------
+    px, py     : click position in tile pixels, 0 <= value < 256 (floats
+                 allowed; the sub-pixel position is honoured on the 4096 grid)
+    radius_px  : circular hit-test radius, 0-8 pixels
+    revision   : optional revision pin; defaults to the head revision
+
+    Every source feature is compiled through the same projection / clip /
+    simplify / quantise pipeline used for the MVT bytes, and the click is
+    adjudicated against the resulting visible geometry: inside a polygon is
+    distance 0, lines and points must lie within the circular radius, and
+    features only visible inside the 8 px buffer rim are adjudicated by the
+    same radius.  Geometries that vanish under quantisation never hit.  Hits
+    carry the 0-based source index, the source ID, the source properties and
+    the pixel distance, sorted by distance then source index; ID-less,
+    string-ID and duplicate-ID features are reported individually, never
+    merged.  The endpoint is read-only: tile bytes and ETags are unaffected.
+    """
+    try:
+        z_i, x_i, y_i = _parse_tile_coord(z, x, y)
+        params = request.query_params
+        px = _parse_pixel_param(params.get("px"), "px")
+        py = _parse_pixel_param(params.get("py"), "py")
+        radius_px = _parse_radius_param(params.get("radius_px"))
+        revision = _parse_optional_revision_param(params.get("revision"))
+    except ValueError as exc:
+        return _error(400, str(exc))
+
+    with db.connection() as conn:
+        dataset = db.get_dataset(conn, dataset_id)
+        if dataset is None:
+            return _error(404, "dataset not found", dataset_id=dataset_id)
+        layer_name = dataset["layer"]
+        head_revision = dataset["latest_revision"]
+        chosen_revision = revision if revision is not None else head_revision
+        if db.get_revision(conn, dataset_id, chosen_revision) is None:
+            return _error(
+                404,
+                f"revision {chosen_revision} does not exist",
+                dataset_id=dataset_id,
+                latest_revision=head_revision,
+            )
+        features = _load_revision_features(conn, dataset_id, chosen_revision)
+
+    hits = identify_features(features, z_i, x_i, y_i, px, py, radius_px)
+    return JSONResponse(
+        content={
+            "dataset_id": dataset_id,
+            "layer": layer_name,
+            "revision": chosen_revision,
+            "z": z_i,
+            "x": x_i,
+            "y": y_i,
+            "px": px,
+            "py": py,
+            "radius_px": radius_px,
+            "hits": hits,
+        }
     )
 
 

@@ -15,12 +15,13 @@
 | 不可变版本 | 每次发布写入一个新的 revision；历史 revision 永不被覆盖，可通过 `?revision=N` 固定取瓦片 |
 | 乐观并发控制 | 发布新版本必须携带 `expected_revision`，与当前 head 不一致时返回 **409 Conflict**；head 比较、revision 插入与 head 更新在单个跨进程有效的 `BEGIN IMMEDIATE` 事务内原子完成，多 worker 并发追加也只有一方成功 |
 | 瓦片编译 | `GET /datasets/{id}/tiles/{z}/{x}/{y}.mvt`，支持 **z = 0–14** 的 XYZ 瓦片 |
+| 点选识别 | `GET /datasets/{id}/tiles/{z}/{x}/{y}/identify?px=&py=&radius_px=`：把每个源要素**逐一**走既有编译管线得到可见几何，按可见几何到点击点的距离裁决命中（面内为 0，线 / 点须在圆形半径内，缓冲边缘同半径裁决），返回源序号（0 起）、源 ID、属性与像素距离，按距离、源序号排序；无 ID / 字符串 ID / 重复 ID 不合并，量化消失的几何不命中，瓦片字节与 ETag 不受影响（见 [§4.7](#47-点选识别identify)） |
 | 离线增量清单 | `GET /datasets/{id}/tile-diff?from_revision=&to_revision=&z=`，按 **x、y 升序**返回两个修订间**实际 MVT 字节发生变化**的瓦片坐标及两端 ETag（ETag 与钉版瓦片逐字节一致）；候选范围由两份 GeoJSON 的全部要素几何（含无 ID / 重复 ID）外扩 **8 px 缓冲**求并集得到，新增 / 删除 / 移动 / 属性变化及缓冲邻瓦片都不漏报，源文档不同但瓦片编码相同不报，**z=14 局部更新只枚举局部邻瓦片** |
 | 投影 | EPSG:4326 经纬度 → 球面 Web Mercator（R = 6378137），瓦片内坐标系为 4096 网格、Y 轴向下 |
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
 | 0.5 px 拓扑简化 | 以 **0.5 px（8/4096 单位）**容差做保拓扑 Douglas–Peucker 简化 |
 | 4096 量化 | 坐标四舍五入到整数 4096 网格，并清除退化线 / 零面积环 |
-| 退化环裁决 | 量化后面环坍缩（合法小多边形的顶点全部落入同一网格点）时**逐环清理、按能否围成有效面积裁决**：外环坍缩仅丢该面、内环坍缩仅去该孔、MultiPolygon 保留其余有效子面；瓦片返回 **200** 与可编码 MVT 而非 500，同瓦片其他要素与既有瓦片字节、钉版 ETag 均不变（见 [§4.8](#48-退化小多边形坍缩环裁决复核)） |
+| 退化环裁决 | 量化后面环坍缩（合法小多边形的顶点全部落入同一网格点）时**逐环清理、按能否围成有效面积裁决**：外环坍缩仅丢该面、内环坍缩仅去该孔、MultiPolygon 保留其余有效子面；瓦片返回 **200** 与可编码 MVT 而非 500，同瓦片其他要素与既有瓦片字节、钉版 ETag 均不变（见 [§4.9](#49-退化小多边形坍缩环裁决复核)） |
 | 稳定排序 | 图层按名称、要素按 ID（数值 → 字符串 → 内容哈希）确定性排序后编码 |
 | 字节一致 / ETag | 同一 revision + 同一瓦片坐标，重复请求**字节完全相同、ETag 相同**；已编译瓦片持久化到 SQLite |
 | 条件请求 | 支持 `If-None-Match`，命中时返回 **304 Not Modified** |
@@ -34,8 +35,9 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、瓦片增量清单、错误处理
+│   ├── main.py          # FastAPI 路由：发布、版本、瓦片、点选识别、瓦片增量清单、错误处理
 │   ├── tiler.py         # 裁剪 / 简化 / 量化 / 稳定排序 / MVT 编码
+│   ├── identify.py      # 点选识别：逐源编译可见几何，按到点击点的距离裁决命中
 │   ├── tilediff.py      # 瓦片增量候选集：几何 mercator 包围盒外扩 8 px 求并集
 │   ├── projection.py    # EPSG:4326 -> Web Mercator -> 瓦片 4096 网格
 │   ├── geojson.py       # GeoJSON 校验与规范化
@@ -43,12 +45,12 @@
 │   └── config.py        # 环境变量配置
 ├── data/
 │   ├── sample.geojson          # 示例图层（点 / 线 / 面）
-│   ├── tiny-polygon.geojson    # 退化小多边形复核 revision 1（含 ~0.1 mm 小三角，见 §4.8）
+│   ├── tiny-polygon.geojson    # 退化小多边形复核 revision 1（含 ~0.1 mm 小三角，见 §4.9）
 │   ├── tiny-polygon-v2.geojson # 复核 revision 2：删除小三角、点属性改名
 │   └── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（91 个用例，含瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（109 个用例，含点选识别、瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -750,14 +752,151 @@ curl -s -i "http://localhost:8000/datasets/nope/tile-diff?from_revision=1&to_rev
 `GET /datasets/{id}/tiles/...` 接口、`If-None-Match` 与钉版（`?revision=`）结果均保持
 可用，清单编译出的瓦片也会复用 / 写入同一张 `tile_cache`。
 
-### 4.7 错误示例
+### 4.7 点选识别（identify）
+
+`GET /datasets/{id}/tiles/{z}/{x}/{y}/identify` 回答“这块瓦片的这个像素上
+有哪些可见要素”。它把该 revision 的**每个源要素逐一**送入与瓦片完全相同的
+编译管线（投影 → 8 px 缓冲裁剪 → 0.5 px 简化 → 4096 量化），得到**可见几何**后
+按到点击点的距离裁决命中——逐源编译（而非解码 MVT）保留了 0 起始的源序号，
+因此无 ID、字符串 ID、重复 ID 的要素都逐条上报、绝不合并；点击点在 4096 网格上
+保留**亚像素**浮点位置（1 px = 16 单位），不吸附到整数网格。
+
+| 查询参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `px` / `py` | 必填，`0 ≤ 值 < 256`，可为小数 | 瓦片内点击像素（亚像素位置有效） |
+| `radius_px` | 必填，`0–8` | 圆形命中半径（像素） |
+| `revision` | 可选，省略时查 head | 固定到某个不可变 revision |
+
+裁决规则：
+
+- **面内为零**：点击点落在可见面内（含边界）时距离为 0，必然命中；
+- **线和点须在圆形半径内**：距离 ≤ `radius_px` 才命中，半径边界含等号；
+- **缓冲边缘同半径裁决**：只进入 8 px 缓冲带的要素同样按该半径命中；
+- **量化消失的几何不得命中**：管线返回 `None` 的要素（如坍缩小面）不参与；
+- 命中按 **`distance_px` 升序、再按 `source_index` 升序**排列。
+
+响应含 `revision` 与 `hits`；每条命中含 `source_index`（源序号，0 起）、
+`id`（源 ID，无 ID 为 `null`）、`properties`（源属性）与 `distance_px`
+（像素距离）。该端点只读：**瓦片字节与 ETag 完全不受影响**。
+
+以下示例基于 [§4.1](#41-发布图层创建数据集revision-1) 发布的
+`data/sample.geojson`（点 Beijing / Tokyo、线 Yellow River、面 Demo rectangle）。
+
+**第 1 步：在 z=0 世界瓦片上点选北京**（北京量化后的像素位置为
+(210.75, 97)，这里用亚像素坐标精确点击，`radius_px=8`）：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=210.75&py=97&radius_px=8" \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "dataset_id": "45b98665e49247a4a17837995935aa23",
+    "layer": "demo",
+    "revision": 1,
+    "z": 0,
+    "x": 0,
+    "y": 0,
+    "px": 210.75,
+    "py": 97.0,
+    "radius_px": 8.0,
+    "hits": [
+        {
+            "source_index": 0,
+            "id": 1001,
+            "properties": {
+                "kind": "capital",
+                "name": "Beijing"
+            },
+            "distance_px": 0.0
+        },
+        {
+            "source_index": 2,
+            "id": 2001,
+            "properties": {
+                "name": "Yellow River approx",
+                "scalerank": 5
+            },
+            "distance_px": 1.30444
+        }
+    ]
+}
+```
+
+北京点（源序号 0）距离 0 排最前；黄河线（源序号 2）距点击点约 1.30 px，
+在半径内一并命中；8 px 半径外的 Tokyo 与矩形不出现。
+
+**第 2 步：面内为零**——点击 Demo 矩形内部，`radius_px=0` 也命中：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=202.7&py=117.2&radius_px=0"
+```
+
+```json
+{
+    "dataset_id": "45b98665e49247a4a17837995935aa23",
+    "layer": "demo",
+    "revision": 1,
+    "z": 0, "x": 0, "y": 0,
+    "px": 202.7, "py": 117.2, "radius_px": 0.0,
+    "hits": [
+        {
+            "source_index": 3,
+            "id": 3001,
+            "properties": {"name": "Demo rectangle"},
+            "distance_px": 0.0
+        }
+    ]
+}
+```
+
+（实际响应为一行 JSON，上表为便于阅读做了格式化；`z/x/y` 等回显字段同前。）
+
+**第 3 步：无命中与错误**——空白处返回空命中列表（仍为 200）：
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=10&py=10&radius_px=2"
+```
+
+```json
+{"dataset_id":"45b98665e49247a4a17837995935aa23","layer":"demo","revision":1,"z":0,"x":0,"y":0,"px":10.0,"py":10.0,"radius_px":2.0,"hits":[]}
+```
+
+```bash
+# 半径越界（> 8）；缺少 px/py/radius_px、坐标越界（px ≥ 256）、非数字同样返回 400
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=10&py=10&radius_px=9"
+# HTTP/1.1 400 Bad Request
+# {"error":"'radius_px' must be between 0 and 8"}
+
+# 非法瓦片号
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/15/0/0/identify?px=1&py=1&radius_px=1"
+# HTTP/1.1 400 Bad Request
+# {"error":"zoom z must be between 0 and 14"}
+
+# 数据集 / 版本不存在
+curl -s -i "http://localhost:8000/datasets/nope/tiles/0/0/0/identify?px=1&py=1&radius_px=1"
+# HTTP/1.1 404 Not Found
+# {"error":"dataset not found","dataset_id":"nope"}
+
+curl -s -i "http://localhost:8000/datasets/$DS/tiles/0/0/0/identify?px=1&py=1&radius_px=1&revision=9"
+# HTTP/1.1 404 Not Found
+# {"error":"revision 9 does not exist","dataset_id":"...","latest_revision":1}
+```
+
+**钉版与只读**：`?revision=N` 固定到历史 revision 点选（省略时查 head，head
+推进后结果随之变化）；点选只读取既有编译管线，不写入 `tile_cache`，同一
+`(dataset, revision, z, x, y)` 的瓦片字节与 ETag 在点选前后逐字节一致。
+
+### 4.8 错误示例
 
 | 场景 | 状态码 |
 | --- | --- |
 | GeoJSON 不是 FeatureCollection / 空集合 / JSON 解析失败 / 坐标越界 / 自交多边形 / null 几何 | `400` |
 | 瓦片 `z` 超出 0–14、`x/y` 为负或超出该级别范围、非整数 | `400` |
 | tile-diff 缺少 `from_revision` / `to_revision` / `z`、修订号非整数或 < 1、`z` 超出 0–14 | `400` |
-| 数据集或 `revision` 不存在（含 tile-diff 的任一修订） | `404` |
+| identify 缺少 `px` / `py` / `radius_px`、点击坐标越界（`0 ≤ px,py < 256`）、半径越界（0–8）或非数字、`revision` 非整数或 < 1 | `400` |
+| 数据集或 `revision` 不存在（含 tile-diff 的任一修订、identify 的钉版修订） | `404` |
 | 发布版本时 `expected_revision` 与 head 不一致 | `409` |
 | 上传体积超过限制（默认 50 MB） | `413` |
 
@@ -779,7 +918,7 @@ curl -i -X POST http://localhost:8000/datasets \
 # {"error":"FeatureCollection contains no features"}
 ```
 
-### 4.8 退化小多边形：坍缩环裁决复核
+### 4.9 退化小多边形：坍缩环裁决复核
 
 源 GeoJSON 中**完全合法**的小多边形（例如边长约 0.1 mm 的三角形）在 4096 网格
 量化时，环的全部顶点可能四舍五入到**同一个网格点**：环坍缩成两点，无法构成 GEOS
@@ -996,7 +1135,7 @@ curl -s -w "\n%{http_code}\n" -X POST http://localhost:8000/datasets \
    仅丢弃该面，内环坍缩仅去除该孔，MultiPolygon 的坍缩子面不影响其余有效
    子面——坍缩环因此永远不会以两点 LinearRing 的形式进入 GEOS 重建而抛出
    `GEOSException`，同瓦片其他要素保持不变（复核见
-   [§4.8](#48-退化小多边形坍缩环裁决复核)）。
+   [§4.9](#49-退化小多边形坍缩环裁决复核)）。
 5. **稳定排序编码**：图层名升序，要素按 ID 分类确定性排序
    （非负整数 ID → 字符串 ID → 无 ID 者按内容 SHA-256），属性键排序，
    再交给 `mapbox-vector-tile` 编码为 MVT v2（`extent=4096`）。
@@ -1026,6 +1165,7 @@ ETag 会持久化在 SQLite `tile_cache` 表中，因此重复请求乃至服务
 | `GET` | `/datasets/{id}` | 数据集元数据与全部 revision |
 | `GET/HEAD` | `/datasets/{id}/tiles/{z}/{x}/{y}.mvt` | 获取瓦片（支持 `?revision=N` 与 `If-None-Match`） |
 | `GET` | `/datasets/{id}/tile-diff` | 两修订间实际字节变化的瓦片增量清单（`from_revision`、`to_revision`、`z=0–14`） |
+| `GET` | `/datasets/{id}/tiles/{z}/{x}/{y}/identify` | 点选识别：`px`、`py`（`0 ≤ 值 < 256`）、`radius_px`（0–8）、可选 `revision`，按可见几何距离返回命中列表 |
 | `GET` | `/healthz` | 健康检查 |
 | `GET` | `/docs` | Swagger UI 交互文档 |
 
